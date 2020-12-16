@@ -219,6 +219,7 @@ fn main() {
     // umount first so that rmdir works
     umount(&scratch_in_old.to_string_lossy(), None)
         .expect("cannot unmount scratch directory");
+    debug!("remove scratch directory in old root");
     fs::remove_dir(scratch_in_old).expect("cannot remove old scratch location");
 
     // make old root slave, otherwise we would unmount the host root
@@ -226,7 +227,9 @@ fn main() {
         .expect("cannot switch old root to slave");
     umount(&old_root.to_string_lossy(), Some(UmountFlags::DETACH))
         .expect("cannot unmount old root");
-    fs::remove_dir(old_root).expect("cannot remove old root");
+    debug!("remove old root at {} after pivot", &old_root.to_string_lossy());
+    //fs::remove_dir(old_root).expect("cannot remove old root");
+
 
     // XXX run the command
     cmd.status()
