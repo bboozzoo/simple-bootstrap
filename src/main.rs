@@ -91,7 +91,10 @@ fn mount(src : &str, target : &str, fstype: &str, maybe_flags : Option<MountFlag
             }
         }
     }
-    debug!("mount {} -> {} fs: {} flags: 0x{:b}", src, target, fstype,  mnt_flags);
+    debug!("mount {} -> {} fs: {} flags: 0x{:x}",
+           src, target,
+           if fstype == "" { "(none)"} else { fstype },
+           mnt_flags);
     let c_src = CString::new(src).expect("source must not contain null bytes");
     let c_target = CString::new(target).expect("target must not contain null bytes");
     let c_fstype = CString::new(fstype).expect("fs type must not contain null bytes");
@@ -110,6 +113,7 @@ fn umount(target : &str, maybe_flags : Option<UmountFlags>) -> io::Result<()> {
             umnt_flags = umnt_flags | libc::MNT_DETACH;
         }
     }
+    debug!("umount {} flags: 0x{:x}", target, umnt_flags);
     // no const for UMOUNT_NOFOLLOW
     // if flags & UmountFlags::UMOUNT_NOFOLLOW {
     //     umnt_flags = umnt_flags | libc::UMOUNT_NOFOLLOW;
@@ -149,7 +153,7 @@ fn main() {
 
     let tmp = tempdir().expect("cannot create a temporary directory");
     let scratch_dir = tmp.path();
-    debug!("scratch dir: {}", scratch_dir.to_string_lossy());
+    debug!("scratch dir: {}", scratch_dir.display());
 
     debug!("unsharing mount ns");
     unshare_mnt().expect("failed to unshare mount namespace");
@@ -161,14 +165,15 @@ fn main() {
         .expect("cannot make / recursively shared");
 
     mount(scratch_dir_str, scratch_dir_str, "", Some(MountFlags::BIND))
-        .expect(&format!("cannot make {} a mount point", scratch_dir_str));
+        .expect(&format!("cannot make {} a mount point", scratch_dir.display()));
     mount("none", scratch_dir_str, "", Some(MountFlags::UNBINDABLE))
-        .expect(&format!("cannot make {} unbindable", scratch_dir_str));
+        .expect(&format!("cannot make {} unbindable", scratch_dir.display()));
 
     debug!("mounting rootfs from {} to {}", rootfs_str, scratch_dir_str);
 
     mount(&rootfs_str, scratch_dir_str, "", Some(MountFlags::REC | MountFlags::BIND))
-        .expect(&format!("cannot bind mount rootfs from {} to {}", rootfs_str, scratch_dir_str));
+        .expect(&format!("cannot bind mount rootfs from {} to {}", rootfs.display(),
+                         scratch_dir.display()));
 
     // stop propagation of changes to the host
     mount("none", scratch_dir_str, "", Some(MountFlags::REC |MountFlags::SLAVE))
@@ -189,7 +194,7 @@ fn main() {
             .expect(&format!("cannot bind mount {} to {}", loc, target));
         // stop propagation of changes to the host
         mount("none", &target, "", Some(MountFlags::REC | MountFlags::SLAVE))
-              .expect(&format!("cannot make {} rslave", target));
+              .expect(&format!("cannot make {} rslave", target_path.display()));
     }
 
     // setup tmpfs
@@ -204,7 +209,7 @@ fn main() {
     let put_old_str = &put_old.to_string_lossy();
     // this is where the scratch dir is in after pivot world
     let scratch_in_old = old_root.join(&scratch_dir.to_string_lossy()[1..]);
-    debug!("scratch dir after pivot root: {}", &scratch_in_old.to_string_lossy());
+    debug!("scratch dir after pivot root: {}", &scratch_in_old.display());
 
     fs::create_dir(&put_old).expect("cannot create temporary directory for old root");
 
@@ -214,28 +219,31 @@ fn main() {
         .expect("cannot set private propagation on put old");
     // switch root
     pivot_root(scratch_dir_str, put_old_str)
-        .expect(&format!("cannot pivot root to {}", scratch_dir_str));
+        .expect(&format!("cannot pivot root to {}", scratch_dir.display()));
 
     // umount first so that rmdir works
     umount(&scratch_in_old.to_string_lossy(), None)
         .expect("cannot unmount scratch directory");
-    debug!("remove scratch directory in old root");
+    debug!("remove scratch directory in old root {}", scratch_in_old.display());
     fs::remove_dir(scratch_in_old).expect("cannot remove old scratch location");
 
     // make old root slave, otherwise we would unmount the host root
     mount("none", old_root_str, "", Some(MountFlags::REC | MountFlags::SLAVE))
         .expect("cannot switch old root to slave");
-    umount(&old_root.to_string_lossy(), Some(UmountFlags::DETACH))
+    umount(old_root_str, Some(UmountFlags::DETACH))
         .expect("cannot unmount old root");
-    debug!("remove old root at {} after pivot", &old_root.to_string_lossy());
-    //fs::remove_dir(old_root).expect("cannot remove old root");
+    umount(old_root_str, Some(UmountFlags::DETACH))
+        .expect("cannot unmount old root");
+    debug!("remove old root at {} after pivot", &old_root.display());
+    fs::remove_dir(old_root).expect("cannot remove old root");
 
     // move to /mnt
     let new_cwd = Path::new("/mnt");
     env::set_current_dir(&new_cwd)
-        .expect(&format!("cannot change directory to {}", new_cwd.to_string_lossy()));
+        .expect(&format!("cannot change directory to {}", new_cwd.display()));
 
     // XXX run the command
     cmd.status()
         .expect("failed to execute process");
+
 }
