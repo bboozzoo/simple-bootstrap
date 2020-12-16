@@ -2,6 +2,7 @@ use std::process::Command;
 use std::env;
 use std::io;
 use std::ptr;
+use std::fs;
 use std::path::{PathBuf};
 use std::ffi::{CString};
 
@@ -63,32 +64,34 @@ fn pivot_root(new_root : &str, put_old : &str) -> io::Result<()> {
     }
 }
 
-fn mount(src : &str, target : &str, fstype: &str, flags : MountFlags) -> io::Result<()> {
+fn mount(src : &str, target : &str, fstype: &str, maybe_flags : Option<MountFlags>) -> io::Result<()> {
     let mut mnt_flags : libc::c_ulong = 0;
 
-    let extra_bits = flags.bits() & !MountFlags::all().bits();
-    if extra_bits != 0 {
-        return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flags 0b{:b}", extra_bits)))
-    }
-    for flag in &[MountFlags::REC, MountFlags::BIND, MountFlags::SLAVE,
-                  MountFlags::SHARED, MountFlags::PRIVATE,
-                  MountFlags::UNBINDABLE] {
-        if !flags.contains(*flag) {
-            continue
+    if let Some(flags) = maybe_flags {
+        let extra_bits = flags.bits() & !MountFlags::all().bits();
+        if extra_bits != 0 {
+            return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flags 0b{:b}", extra_bits)))
         }
-        match *flag {
-            MountFlags::BIND => mnt_flags = mnt_flags | libc::MS_BIND,
-            MountFlags::REC => mnt_flags = mnt_flags | libc::MS_REC,
-            MountFlags::SLAVE => mnt_flags = mnt_flags | libc::MS_SLAVE,
-            MountFlags::SHARED => mnt_flags = mnt_flags | libc::MS_SHARED,
-            MountFlags::PRIVATE => mnt_flags = mnt_flags | libc::MS_PRIVATE,
-            // there's no libc::MS_UNBINDABLE
-            // sys/mount.h: MS_UNBINDABLE = 1 << 17
-            MountFlags::UNBINDABLE => mnt_flags = mnt_flags | (1<<17),
-            _ => return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flag {:x}", *flag))),
+        for flag in &[MountFlags::REC, MountFlags::BIND, MountFlags::SLAVE,
+                      MountFlags::SHARED, MountFlags::PRIVATE,
+                      MountFlags::UNBINDABLE] {
+            if !flags.contains(*flag) {
+                continue
+            }
+            match *flag {
+                MountFlags::BIND => mnt_flags = mnt_flags | libc::MS_BIND,
+                MountFlags::REC => mnt_flags = mnt_flags | libc::MS_REC,
+                MountFlags::SLAVE => mnt_flags = mnt_flags | libc::MS_SLAVE,
+                MountFlags::SHARED => mnt_flags = mnt_flags | libc::MS_SHARED,
+                MountFlags::PRIVATE => mnt_flags = mnt_flags | libc::MS_PRIVATE,
+                // there's no libc::MS_UNBINDABLE
+                // sys/mount.h: MS_UNBINDABLE = 1 << 17
+                MountFlags::UNBINDABLE => mnt_flags = mnt_flags | (1<<17),
+                _ => return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flag {:x}", *flag))),
+            }
         }
     }
-    debug!("mount {} -> {} flags: 0x{:b}", src, target, mnt_flags);
+    debug!("mount {} -> {} fs: {} flags: 0x{:b}", src, target, fstype,  mnt_flags);
     let c_src = CString::new(src).expect("source must not contain null bytes");
     let c_target = CString::new(target).expect("target must not contain null bytes");
     let c_fstype = CString::new(fstype).expect("fs type must not contain null bytes");
@@ -100,10 +103,12 @@ fn mount(src : &str, target : &str, fstype: &str, flags : MountFlags) -> io::Res
     }
 }
 
-fn umount(target : &str, flags : UmountFlags) -> io::Result<()> {
+fn umount(target : &str, maybe_flags : Option<UmountFlags>) -> io::Result<()> {
     let mut umnt_flags : libc::c_int = 0;
-    if flags.contains(UmountFlags::DETACH) {
-        umnt_flags = umnt_flags | libc::MNT_DETACH;
+    if let Some(flags) = maybe_flags {
+        if flags.contains(UmountFlags::DETACH) {
+            umnt_flags = umnt_flags | libc::MNT_DETACH;
+        }
     }
     // no const for UMOUNT_NOFOLLOW
     // if flags & UmountFlags::UMOUNT_NOFOLLOW {
@@ -140,6 +145,7 @@ fn main() {
     let rootfs_str = rootfs.to_string_lossy();
 
     let mut cmd = cmd_from_args(&args[1..]);
+    cmd.env_clear();
 
     let tmp = tempdir().expect("cannot create a temporary directory");
     let scratch_dir = tmp.path();
@@ -151,21 +157,21 @@ fn main() {
     let scratch_dir_str = &scratch_dir.to_string_lossy();
 
     // only needed if / isn't shared already
-    mount("none", "/", "", MountFlags::REC | MountFlags::SHARED)
+    mount("none", "/", "", Some(MountFlags::REC | MountFlags::SHARED))
         .expect("cannot make / recursively shared");
 
-    mount(scratch_dir_str, scratch_dir_str, "", MountFlags::BIND)
+    mount(scratch_dir_str, scratch_dir_str, "", Some(MountFlags::BIND))
         .expect(&format!("cannot make {} a mount point", scratch_dir_str));
-    mount("none", scratch_dir_str, "", MountFlags::UNBINDABLE)
+    mount("none", scratch_dir_str, "", Some(MountFlags::UNBINDABLE))
         .expect(&format!("cannot make {} unbindable", scratch_dir_str));
 
     debug!("mounting rootfs from {} to {}", rootfs_str, scratch_dir_str);
 
-    mount(&rootfs_str, scratch_dir_str, "", MountFlags::REC | MountFlags::BIND)
+    mount(&rootfs_str, scratch_dir_str, "", Some(MountFlags::REC | MountFlags::BIND))
         .expect(&format!("cannot bind mount rootfs from {} to {}", rootfs_str, scratch_dir_str));
 
     // stop propagation of changes to the host
-    mount("none", scratch_dir_str, "", MountFlags::REC |MountFlags::SLAVE)
+    mount("none", scratch_dir_str, "", Some(MountFlags::REC |MountFlags::SLAVE))
         .expect(&format!("cannot make rootfs at {} rslave", scratch_dir_str));
 
     let from_host = [
@@ -174,30 +180,55 @@ fn main() {
         "/proc",
     ];
     for loc in from_host.iter() {
+        // join with absolute path replaces the path, so drop the leading /
         let target_path = scratch_dir.join(&loc[1..]);
         let target = &target_path.to_string_lossy();
         debug!("rbind mounting {} to {}", loc, target);
         // recursive bind
-        mount(loc, &target, "", MountFlags::REC | MountFlags::BIND)
+        mount(loc, &target, "", Some(MountFlags::REC | MountFlags::BIND))
             .expect(&format!("cannot bind mount {} to {}", loc, target));
         // stop propagation of changes to the host
-        mount("none", &target, "", MountFlags::REC | MountFlags::SLAVE)
+        mount("none", &target, "", Some(MountFlags::REC | MountFlags::SLAVE))
               .expect(&format!("cannot make {} rslave", target));
     }
 
-    let put_old = scratch_dir.join("mnt");
+    // setup tmpfs
+    mount("none", &scratch_dir.join("tmp").to_string_lossy(), "tmpfs", None)
+        .expect("cannot mount a new tmpfs");
+
+    // old rootfs in after pivot world
+    let old_root = PathBuf::from("/tmp/old-root");
+    let old_root_str = &old_root.to_string_lossy();
+    // this it where old root will be put in the before pivot world
+    let put_old = scratch_dir.join("tmp/old-root");
     let put_old_str = &put_old.to_string_lossy();
-    mount(put_old_str, put_old_str, "", MountFlags::BIND)
+    // this is where the scratch dir is in after pivot world
+    let scratch_in_old = old_root.join(&scratch_dir.to_string_lossy()[1..]);
+    debug!("scratch dir after pivot root: {}", &scratch_in_old.to_string_lossy());
+
+    fs::create_dir(&put_old).expect("cannot create temporary directory for old root");
+
+    mount(put_old_str, put_old_str, "", Some(MountFlags::BIND))
         .expect("cannot make put old a mount point");
-    mount("none", put_old_str, "", MountFlags::PRIVATE)
+    mount("none", put_old_str, "", Some(MountFlags::PRIVATE))
         .expect("cannot set private propagation on put old");
+    // switch root
     pivot_root(scratch_dir_str, put_old_str)
         .expect(&format!("cannot pivot root to {}", scratch_dir_str));
 
-    // TODO: post pivot cleanup
+    // umount first so that rmdir works
+    umount(&scratch_in_old.to_string_lossy(), None)
+        .expect("cannot unmount scratch directory");
+    fs::remove_dir(scratch_in_old).expect("cannot remove old scratch location");
+
+    // make old root slave, otherwise we would unmount the host root
+    mount("none", old_root_str, "", Some(MountFlags::REC | MountFlags::SLAVE))
+        .expect("cannot switch old root to slave");
+    umount(&old_root.to_string_lossy(), Some(UmountFlags::DETACH))
+        .expect("cannot unmount old root");
+    fs::remove_dir(old_root).expect("cannot remove old root");
 
     // XXX run the command
-    cmd.env_clear();
     cmd.status()
         .expect("failed to execute process");
 }
