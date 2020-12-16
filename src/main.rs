@@ -3,7 +3,7 @@ use std::env;
 use std::io;
 use std::ptr;
 use std::fs;
-use std::path::{PathBuf};
+use std::path::{PathBuf, Path};
 use std::ffi::{CString};
 
 use log::{debug, LevelFilter};
@@ -230,6 +230,10 @@ fn main() {
     debug!("remove old root at {} after pivot", &old_root.to_string_lossy());
     //fs::remove_dir(old_root).expect("cannot remove old root");
 
+    // move to /mnt
+    let new_cwd = Path::new("/mnt");
+    env::set_current_dir(&new_cwd)
+        .expect(&format!("cannot change directory to {}", new_cwd.to_string_lossy()));
 
     // XXX run the command
     cmd.status()
