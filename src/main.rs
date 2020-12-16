@@ -2,12 +2,34 @@ use std::process::Command;
 use std::env;
 use std::io;
 use std::ptr;
+use std::path::{PathBuf};
 use std::ffi::{CString};
 
 use log::{debug, LevelFilter};
 use env_logger;
 use libc;
 use tempfile::tempdir;
+
+#[macro_use]
+extern crate bitflags;
+
+bitflags! {
+    struct MountFlags : u32 {
+        const REC        = 0b000001;
+        const BIND       = 0b000010;
+        const SLAVE      = 0b000100;
+        const SHARED     = 0b001000;
+        const PRIVATE    = 0b010000;
+        const UNBINDABLE = 0b100000;
+    }
+}
+
+bitflags! {
+    struct UmountFlags : u32 {
+        const NOFOLLOW  = 0b000001;
+        const DETACH    = 0b000010;
+    }
+}
 
 fn init_log() {
     env_logger::Builder::new()
@@ -30,53 +52,152 @@ fn unshare_mnt() -> io::Result<()> {
     }
 }
 
-fn mount(src : &str, target : &str, fstype: &str, maybe_options : Option<&Vec<&str>>) -> io::Result<()> {
-    let mut flags : libc::c_ulong = 0;
-    if let Some(options) = maybe_options {
-        for opt in options {
-            match *opt {
-                "bind" => flags = flags | libc::MS_BIND,
-                "rbind" => flags = flags | libc::MS_BIND | libc::MS_REC,
-                "slave" => flags = flags | libc::MS_SLAVE,
-                "shared" => flags = flags | libc::MS_SHARED,
-                "private" => flags = flags | libc::MS_PRIVATE,
-                _ => return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected option {}", opt))),
-            }
+fn pivot_root(new_root : &str, put_old : &str) -> io::Result<()> {
+    debug!("pivot root to {} old at {}", new_root, put_old);
+    // TODO pass args
+    let c_new_root = CString::new(new_root).expect("new root must not contain null bytes");
+    let c_put_old = CString::new(put_old).expect("put old must not contain null bytes");
+    match libc_result(unsafe{ libc::syscall(libc::SYS_pivot_root, c_new_root.as_ptr(), c_put_old.as_ptr())}, 0) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err)
+    }
+}
+
+fn mount(src : &str, target : &str, fstype: &str, flags : MountFlags) -> io::Result<()> {
+    let mut mnt_flags : libc::c_ulong = 0;
+
+    let extra_bits = flags.bits() & !MountFlags::all().bits();
+    if extra_bits != 0 {
+        return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flags 0b{:b}", extra_bits)))
+    }
+    for flag in &[MountFlags::REC, MountFlags::BIND, MountFlags::SLAVE,
+                  MountFlags::SHARED, MountFlags::PRIVATE,
+                  MountFlags::UNBINDABLE] {
+        if !flags.contains(*flag) {
+            continue
+        }
+        match *flag {
+            MountFlags::BIND => mnt_flags = mnt_flags | libc::MS_BIND,
+            MountFlags::REC => mnt_flags = mnt_flags | libc::MS_REC,
+            MountFlags::SLAVE => mnt_flags = mnt_flags | libc::MS_SLAVE,
+            MountFlags::SHARED => mnt_flags = mnt_flags | libc::MS_SHARED,
+            MountFlags::PRIVATE => mnt_flags = mnt_flags | libc::MS_PRIVATE,
+            // there's no libc::MS_UNBINDABLE
+            // sys/mount.h: MS_UNBINDABLE = 1 << 17
+            MountFlags::UNBINDABLE => mnt_flags = mnt_flags | (1<<17),
+            _ => return Err(io::Error::new(io::ErrorKind::Other, format!("unexpected flag {:x}", *flag))),
         }
     }
+    debug!("mount {} -> {} flags: 0x{:b}", src, target, mnt_flags);
     let c_src = CString::new(src).expect("source must not contain null bytes");
     let c_target = CString::new(target).expect("target must not contain null bytes");
     let c_fstype = CString::new(fstype).expect("fs type must not contain null bytes");
     match libc_result(unsafe{ libc::mount(c_src.as_ptr(), c_target.as_ptr(),
-                                          c_fstype.as_ptr(), flags, ptr::null())},
+                                          c_fstype.as_ptr(), mnt_flags, ptr::null())},
                       0) {
         Ok(_) => Ok(()),
         Err(err) => Err(err)
     }
 }
 
+fn umount(target : &str, flags : UmountFlags) -> io::Result<()> {
+    let mut umnt_flags : libc::c_int = 0;
+    if flags.contains(UmountFlags::DETACH) {
+        umnt_flags = umnt_flags | libc::MNT_DETACH;
+    }
+    // no const for UMOUNT_NOFOLLOW
+    // if flags & UmountFlags::UMOUNT_NOFOLLOW {
+    //     umnt_flags = umnt_flags | libc::UMOUNT_NOFOLLOW;
+    // }
+    let c_target = CString::new(target).expect("target must not contain null bytes");
+    match libc_result(unsafe {libc::umount2(c_target.as_ptr(), umnt_flags)}, 0) {
+        Ok(_) => Ok(()),
+        Err(err) => Err(err)
+    }
+}
+
+fn cmd_from_args(program_args : &[String]) -> Command {
+    debug!("command: {}", program_args[0]);
+    let mut cmd = Command::new(program_args[0].as_str());
+    for arg in program_args.iter().skip(1) {
+        debug!("argument: \"{}\"", arg);
+        cmd.arg(arg.as_str());
+    }
+    return cmd
+}
+
 fn main() {
     init_log();
 
     let args : Vec<String> = env::args().skip(1).collect();
-    if args.len() == 0 {
-        return ();
+    if args.len() < 2 {
+        panic!("rootfs or command not provided");
     }
-    debug!("command: {}", args[0]);
-    let mut cmd = Command::new(args[0].as_str());
-    for arg in args.iter().skip(1) {
-        debug!("argument: \"{}\"", arg);
-        cmd.arg(arg.as_str());
-    }
-    cmd.env_clear();
-    // cmd.status()
-    //     .expect("failed to execute process");
-    let tmp = tempdir().expect("cannot create a temporary directory");
-    let root_tmp = tmp.path();
-    debug!("root tmp: {}", root_tmp.to_string_lossy());
+    let rootfs_unresolved = &args[0];
+    debug!("new rootfs: {}", rootfs_unresolved);
+    let rootfs = PathBuf::from(rootfs_unresolved).canonicalize()
+        .expect(&format!("cannot resolve path: {}", rootfs_unresolved));
+    let rootfs_str = rootfs.to_string_lossy();
 
+    let mut cmd = cmd_from_args(&args[1..]);
+
+    let tmp = tempdir().expect("cannot create a temporary directory");
+    let scratch_dir = tmp.path();
+    debug!("scratch dir: {}", scratch_dir.to_string_lossy());
+
+    debug!("unsharing mount ns");
     unshare_mnt().expect("failed to unshare mount namespace");
 
-    mount("", &root_tmp.to_string_lossy(), "tmpfs", None)
-        .expect("cannot mount tmpfs");
+    let scratch_dir_str = &scratch_dir.to_string_lossy();
+
+    // only needed if / isn't shared already
+    mount("none", "/", "", MountFlags::REC | MountFlags::SHARED)
+        .expect("cannot make / recursively shared");
+
+    mount(scratch_dir_str, scratch_dir_str, "", MountFlags::BIND)
+        .expect(&format!("cannot make {} a mount point", scratch_dir_str));
+    mount("none", scratch_dir_str, "", MountFlags::UNBINDABLE)
+        .expect(&format!("cannot make {} unbindable", scratch_dir_str));
+
+    debug!("mounting rootfs from {} to {}", rootfs_str, scratch_dir_str);
+
+    mount(&rootfs_str, scratch_dir_str, "", MountFlags::REC | MountFlags::BIND)
+        .expect(&format!("cannot bind mount rootfs from {} to {}", rootfs_str, scratch_dir_str));
+
+    // stop propagation of changes to the host
+    mount("none", scratch_dir_str, "", MountFlags::REC |MountFlags::SLAVE)
+        .expect(&format!("cannot make rootfs at {} rslave", scratch_dir_str));
+
+    let from_host = [
+        "/dev",
+        "/sys",
+        "/proc",
+    ];
+    for loc in from_host.iter() {
+        let target_path = scratch_dir.join(&loc[1..]);
+        let target = &target_path.to_string_lossy();
+        debug!("rbind mounting {} to {}", loc, target);
+        // recursive bind
+        mount(loc, &target, "", MountFlags::REC | MountFlags::BIND)
+            .expect(&format!("cannot bind mount {} to {}", loc, target));
+        // stop propagation of changes to the host
+        mount("none", &target, "", MountFlags::REC | MountFlags::SLAVE)
+              .expect(&format!("cannot make {} rslave", target));
+    }
+
+    let put_old = scratch_dir.join("mnt");
+    let put_old_str = &put_old.to_string_lossy();
+    mount(put_old_str, put_old_str, "", MountFlags::BIND)
+        .expect("cannot make put old a mount point");
+    mount("none", put_old_str, "", MountFlags::PRIVATE)
+        .expect("cannot set private propagation on put old");
+    pivot_root(scratch_dir_str, put_old_str)
+        .expect(&format!("cannot pivot root to {}", scratch_dir_str));
+
+    // TODO: post pivot cleanup
+
+    // XXX run the command
+    cmd.env_clear();
+    cmd.status()
+        .expect("failed to execute process");
 }
